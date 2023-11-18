@@ -1,0 +1,577 @@
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d58c0389e..cdc120e5b 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -10386,6 +10386,47 @@ static u64 cpu_shares_read_u64(struct cgroup_subsys_state *css,
+ 	return (u64) scale_load_down(tg->shares);
+ }
+ 
++static u64 cpu_latency_awareness_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return tg->latency_awareness;
++}
++
++static int cpu_latency_awareness_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        struct task_group *tg = css_tg(css);
++        tg->latency_awareness = value;
++        return 0;
++}
++
++static u64 cpu_load_avg_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return atomic_long_read(&tg->load_avg);;
++}
++
++static int cpu_load_avg_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        return 0;
++}
++
++static u64 cpu_load_avg_ema_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return atomic_long_read(&tg->load_avg_ema);
++}
++
++static int cpu_load_avg_ema_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        return 0;
++}
++
+ #ifdef CONFIG_CFS_BANDWIDTH
+ static DEFINE_MUTEX(cfs_constraints_mutex);
+ 
+@@ -10757,6 +10798,21 @@ static struct cftype cpu_legacy_files[] = {
+ 		.read_u64 = cpu_shares_read_u64,
+ 		.write_u64 = cpu_shares_write_u64,
+ 	},
++        {
++                .name = "latency_awareness",
++                .read_u64 = cpu_latency_awareness_read_u64,
++                .write_u64 = cpu_latency_awareness_write_u64,
++        },
++        {
++                .name = "load_avg",
++                .read_u64 = cpu_load_avg_read_u64,
++                .write_u64 = cpu_load_avg_write_u64,
++        },
++        {
++                .name = "load_avg_ema",
++                .read_u64 = cpu_load_avg_ema_read_u64,
++                .write_u64 = cpu_load_avg_ema_write_u64,
++        },
+ 	{
+ 		.name = "idle",
+ 		.read_s64 = cpu_idle_read_s64,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a68482d66..5df4c681f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -124,6 +124,91 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+ 
+ const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
+ 
++//mechanisms to mitigate contention
++unsigned int sched_disable_calc_group_shares = 0;
++unsigned int sched_disable_vruntime_preemption = 0;
++
++// sched_entity_before_policy == 0 entity_before(a,b);
++// sched_entity_before_policy == 1 entity_before_tg_load_avg_dynamic(a,b);
++unsigned int sched_entity_before_policy = 0;
++unsigned int sched_check_preempt_wakeup_latency_awareness = 0;
++unsigned int sched_cpu_has_higher_load_task = 0;
++
++unsigned int sched_tg_load_avg_ema = 0;
++unsigned int sched_tg_load_avg_ema_window = 0;
++
++#ifdef CONFIG_SYSCTL
++static int sched_latency_awareness_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos);
++static struct ctl_table sched_cfs_latency_awareness_sysctls[] = {
++        {
++                .procname       = "sched_disable_calc_group_shares",
++                .data           = &sched_disable_calc_group_shares,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_disable_vruntime_preemption",
++                .data           = &sched_disable_vruntime_preemption,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },        
++        {
++                .procname       = "sched_entity_before_policy",
++                .data           = &sched_entity_before_policy,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_check_preempt_wakeup_latency_awareness",
++                .data           = &sched_check_preempt_wakeup_latency_awareness,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_cpu_has_higher_load_task",
++                .data           = &sched_cpu_has_higher_load_task,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_tg_load_avg_ema",
++                .data           = &sched_tg_load_avg_ema,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_tg_load_avg_ema_window",
++                .data           = &sched_tg_load_avg_ema_window,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++ {}
++};
++
++static int __init sched_cfs_latency_awareness_sysctl_init(void)
++{
++        register_sysctl_init("kernel", sched_cfs_latency_awareness_sysctls);
++        return 0;
++}
++late_initcall(sched_cfs_latency_awareness_sysctl_init);
++#endif
++
++static int sched_latency_awareness_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos)
++{
++        int ret;
++        ret = proc_dointvec(table, write, buffer, lenp, ppos);
++        return ret;
++}
++
+ int sched_thermal_decay_shift;
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+@@ -573,6 +658,41 @@ static inline bool entity_before(struct sched_entity *a,
+ 	return (s64)(a->vruntime - b->vruntime) < 0;
+ }
+ 
++static inline bool entity_before_tg_load_avg_dynamic(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	struct task_group *tga, *tgb;
++	long tga_load, tgb_load;
++
++	if (!entity_is_task(a) && !entity_is_task(b)){
++
++		tga = group_cfs_rq(a)->tg;
++		tgb = group_cfs_rq(b)->tg;
++
++		//only adjust default policy for pod-level entities
++		if ((tga->latency_awareness) && (tgb->latency_awareness)) {
++
++			tga_load = atomic_long_read(&tga->load_avg_ema);
++			tgb_load = atomic_long_read(&tgb->load_avg_ema);
++
++			if (tga_load < tgb_load) //we can install a threshold here
++				return true; //a has lower load, then goes before
++
++			else //if (tga_load >= tgb_load)
++				return false; //a is not lower load, so does not go before
++
++		} else return entity_before(a,b);
++
++	} else return entity_before(a,b);
++}
++
++static inline bool entity_before_patch(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	if (sched_entity_before_policy == 1) return entity_before_tg_load_avg_dynamic(a,b);
++	else return entity_before(a,b);
++}
++
+ #define __node_2_se(node) \
+ 	rb_entry((node), struct sched_entity, run_node)
+ 
+@@ -609,7 +729,7 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 
+ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+ {
+-	return entity_before(__node_2_se(a), __node_2_se(b));
++	return entity_before_patch(__node_2_se(a), __node_2_se(b));
+ }
+ 
+ /*
+@@ -3265,7 +3385,9 @@ static void update_cfs_group(struct sched_entity *se)
+ 	if (likely(se->load.weight == shares))
+ 		return;
+ #else
++	if (!sched_disable_calc_group_shares)
+ 	shares   = calc_group_shares(gcfs_rq);
++	else shares = READ_ONCE(gcfs_rq->tg->shares);
+ #endif
+ 
+ 	reweight_entity(cfs_rq_of(se), se, shares);
+@@ -3374,6 +3496,7 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ {
+ 	long delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
++	struct task_group *tg = cfs_rq->tg;
+ 
+ 	/*
+ 	 * No need to update load_avg for root_task_group as it is not used.
+@@ -3385,6 +3508,13 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ 		atomic_long_add(delta, &cfs_rq->tg->load_avg);
+ 		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
+ 	}
++
++	if (sched_tg_load_avg_ema){
++		long prev = atomic_long_read(&tg->load_avg_ema);
++		long curr = atomic_long_read(&tg->load_avg);
++		long delta = ((((curr - prev)*2))/(1+sched_tg_load_avg_ema_window)); //+ prev;
++		atomic_long_add(delta, &tg->load_avg_ema);
++	}
+ }
+ 
+ /*
+@@ -4497,6 +4627,9 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	if (delta_exec < sysctl_sched_min_granularity)
+ 		return;
+ 
++	if (sched_disable_vruntime_preemption)
++		return;
++
+ 	se = __pick_first_entity(cfs_rq);
+ 	delta = curr->vruntime - se->vruntime;
+ 
+@@ -4565,7 +4698,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	 * If curr is set we have to see if its left of the leftmost entity
+ 	 * still in the tree, provided there was anything in the tree at all.
+ 	 */
+-	if (!left || (curr && entity_before(curr, left)))
++	if (!left || (curr && entity_before_patch(curr, left)))
+ 		left = curr;
+ 
+ 	se = left; /* ideally we run the leftmost entity */
+@@ -4581,7 +4714,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 			second = __pick_first_entity(cfs_rq);
+ 		} else {
+ 			second = __pick_next_entity(se);
+-			if (!second || (curr && entity_before(curr, second)))
++			if (!second || (curr && entity_before_patch(curr, second)))
+ 				second = curr;
+ 		}
+ 
+@@ -5637,6 +5770,45 @@ static int sched_idle_cpu(int cpu)
+ }
+ #endif
+ 
++//in order for this to work, I need to coordinate as well in the two locations
++//1) check_preempt_wakeup (using set_next_buddy to give priority to least loaded task)
++//2) entity_before (keeping all most loaded task at the back of the queue)
++//         (or via WEIGHT_IDLEPRIO or calc_delta_fair)
++//3) sched_slice (increasing the minimum granularity of tasks)
++
++//please refer to get_experiment_cfspatched_iteration6
++
++static int cpu_has_higher_load_task(struct task_struct *p, int target, int path)
++{
++	if (!sched_cpu_has_higher_load_task) return 0;
++
++	//candidate cpu
++	struct rq *rq = cpu_rq(target);
++
++	unsigned int curr_pod_load_avg = rq->cfs.curr_pod_load_avg;
++
++	//if the currently running entity is not latency aware
++	//then this CPU is defnitely a good target
++	if (!curr_pod_load_avg) return 1;
++
++	//otherwise, we should compare the priority of curr with that of p
++	struct sched_entity *se = &p->se;
++
++	//once you encounter a tg with latency awareness value, do the compare and exit
++	struct task_group *container_tg = cfs_rq_of(se)->tg;
++	struct task_group *pod_tg;
++
++	if (container_tg) {
++		pod_tg = container_tg->parent; //tg corresponding to a pod
++		if (pod_tg && (pod_tg->latency_awareness)){
++			if (atomic_long_read(&pod_tg->load_avg_ema) < curr_pod_load_avg)
++				return 1;
++		} else return 0;
++	}
++
++	return 0;
++}
++
+ /*
+  * The enqueue_task method is called before nr_running is
+  * increased. Here we update the fair scheduling stats and
+@@ -6087,7 +6259,7 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
+ 		if (!sched_core_cookie_match(rq, p))
+ 			continue;
+ 
+-		if (sched_idle_cpu(i))
++		if (sched_idle_cpu(i) || cpu_has_higher_load_task(p,i,20))
+ 			return i;
+ 
+ 		if (available_idle_cpu(i)) {
+@@ -6178,7 +6350,7 @@ static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p
+ 
+ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ {
+-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
++	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,16)) && //cpu_has_higher_load_task 6.2
+ 	    sched_cpu_cookie_match(cpu_rq(cpu), p))
+ 		return cpu;
+ 
+@@ -6249,13 +6421,13 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ 	int cpu;
+ 
+ 	if (!static_branch_likely(&sched_smt_present))
+-		return __select_idle_cpu(core, p);
++		return __select_idle_cpu(core, p); //cpu_has_higher_load_task 6.1
+ 
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+ 		if (!available_idle_cpu(cpu)) {
+ 			idle = false;
+ 			if (*idle_cpu == -1) {
+-				if (sched_idle_cpu(cpu) && cpumask_test_cpu(cpu, p->cpus_ptr)) {
++				if ((sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,17)) && cpumask_test_cpu(cpu, p->cpus_ptr)) { //cpu_has_higher_load_task 6.1
+ 					*idle_cpu = cpu;
+ 					break;
+ 				}
+@@ -6285,7 +6457,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
+ 		if (!cpumask_test_cpu(cpu, p->cpus_ptr) ||
+ 		    !cpumask_test_cpu(cpu, sched_domain_span(sd)))
+ 			continue;
+-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
++		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,15)) //cpu_has_higher_load_task 5
+ 			return cpu;
+ 	}
+ 
+@@ -6365,14 +6537,14 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 
+ 	for_each_cpu_wrap(cpu, cpus, target + 1) {
+ 		if (has_idle_core) {
+-			i = select_idle_core(p, cpu, cpus, &idle_cpu);
++			i = select_idle_core(p, cpu, cpus, &idle_cpu); ////cpu_has_higher_load_task 6.1
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 
+ 		} else {
+ 			if (!--nr)
+ 				return -1;
+-			idle_cpu = __select_idle_cpu(cpu, p);
++			idle_cpu = __select_idle_cpu(cpu, p); //cpu_has_higher_load_task 6.2
+ 			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+ 				break;
+ 		}
+@@ -6416,7 +6588,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 	for_each_cpu_wrap(cpu, cpus, target) {
+ 		unsigned long cpu_cap = capacity_of(cpu);
+ 
+-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu)) //cpu_has_higher_load_task 4 ignore_sched_idle_cpu
+ 			continue;
+ 		if (fits_capacity(task_util, cpu_cap))
+ 			return cpu;
+@@ -6462,7 +6634,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 */
+ 	lockdep_assert_irqs_disabled();
+ 
+-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
++	if ((available_idle_cpu(target) || sched_idle_cpu(target) || cpu_has_higher_load_task(p, target,11)) && //cpu_has_higher_load_task 1
+ 	    asym_fits_capacity(task_util, target))
+ 		return target;
+ 
+@@ -6470,7 +6642,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 * If the previous CPU is cache affine and idle, don't be stupid:
+ 	 */
+ 	if (prev != target && cpus_share_cache(prev, target) &&
+-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
++	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) && //cpu_has_higher_load_task 2 ignore_sched_idle_cpu
+ 	    asym_fits_capacity(task_util, prev))
+ 		return prev;
+ 
+@@ -6496,7 +6668,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if (recent_used_cpu != prev &&
+ 	    recent_used_cpu != target &&
+ 	    cpus_share_cache(recent_used_cpu, target) &&
+-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
++	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu) || cpu_has_higher_load_task(p, recent_used_cpu,13)) && //cpu_has_higher_load_task 3
+ 	    cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr) &&
+ 	    asym_fits_capacity(task_util, recent_used_cpu)) {
+ 		return recent_used_cpu;
+@@ -6517,7 +6689,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		 * capacity path.
+ 		 */
+ 		if (sd) {
+-			i = select_idle_capacity(p, sd, target);
++			i = select_idle_capacity(p, sd, target); //cpu_has_higher_load_task 4
+ 			return ((unsigned)i < nr_cpumask_bits) ? i : target;
+ 		}
+ 	}
+@@ -6530,13 +6702,13 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		has_idle_core = test_idle_cores(target, false);
+ 
+ 		if (!has_idle_core && cpus_share_cache(prev, target)) {
+-			i = select_idle_smt(p, sd, prev);
++			i = select_idle_smt(p, sd, prev); //cpu_has_higher_load_task 5
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 		}
+ 	}
+ 
+-	i = select_idle_cpu(p, sd, has_idle_core, target);
++	i = select_idle_cpu(p, sd, has_idle_core, target); //cpu_has_higher_load_task 6
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
+@@ -7198,6 +7370,26 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ 	if (cse_is_idle != pse_is_idle)
+ 		return;
+ 
++	if (sched_check_preempt_wakeup_latency_awareness == 100){
++		if (!entity_is_task(se) && !entity_is_task(pse)){
++			struct task_group *ctg, *wtg;
++			//latency-awareness patch
++			ctg = group_cfs_rq(se)->tg;
++			wtg = group_cfs_rq(pse)->tg;
++
++			//only preempt the current task if it has a lower priority (i.e. higher load)
++			if (((ctg->latency_awareness) &&  (wtg->latency_awareness))){
++
++				long ctg_load = atomic_long_read(&ctg->load_avg_ema);
++				long wtg_load = atomic_long_read(&wtg->load_avg_ema);
++
++				if (ctg_load > wtg_load) //we can install a threshold here
++					goto preempt; //current has higher load, so preempt it!
++			}
++		}
++	}
++
++	//this mechanism might be necessary to prevent low loaded tasks from taking over the system
+ 	update_curr(cfs_rq_of(se));
+ 	if (wakeup_preempt_entity(se, pse) == 1) {
+ 		/*
+@@ -7266,10 +7458,14 @@ struct task_struct *
+ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ {
+ 	struct cfs_rq *cfs_rq = &rq->cfs;
++	struct cfs_rq *cfs_rq_init = cfs_rq;
+ 	struct sched_entity *se;
+ 	struct task_struct *p;
+ 	int new_tasks;
+ 
++	cfs_rq_init->curr_latency_awareness = 0;
++	cfs_rq_init->curr_pod_load_avg = 0;
++
+ again:
+ 	if (!sched_fair_runnable(rq))
+ 		goto idle;
+@@ -7317,6 +7513,12 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 			}
+ 		}
+ 
++		if (cfs_rq->tg->latency_awareness && !cfs_rq_init->curr_latency_awareness) {
++			//we assume the first latency awwareness flag from the top corresponds to a pod
++			cfs_rq_init->curr_pod_load_avg = atomic_long_read(&cfs_rq->tg->load_avg_ema);
++			cfs_rq_init->curr_latency_awareness = cfs_rq->tg->latency_awareness;
++		}
++
+ 		se = pick_next_entity(cfs_rq, curr);
+ 		cfs_rq = group_cfs_rq(se);
+ 	} while (cfs_rq);
+@@ -10316,7 +10518,7 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ {
+ 	int continue_balancing = 1;
+ 	int cpu = rq->cpu;
+-	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
++	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu); //ignore_sched_idle_cpu
+ 	unsigned long interval;
+ 	struct sched_domain *sd;
+ 	/* Earliest time when we have to do rebalance again */
+@@ -10361,7 +10563,7 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 				 * state even if we migrated tasks. Update it.
+ 				 */
+ 				idle = idle_cpu(cpu) ? CPU_IDLE : CPU_NOT_IDLE;
+-				busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
++				busy = idle != CPU_IDLE && !sched_idle_cpu(cpu); //ignore_sched_idle_cpu
+ 			}
+ 			sd->last_balance = jiffies;
+ 			interval = get_sd_balance_interval(sd, busy);
+@@ -11244,7 +11446,7 @@ static void task_fork_fair(struct task_struct *p)
+ 	}
+ 	place_entity(cfs_rq, se, 1);
+ 
+-	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
++	if (sysctl_sched_child_runs_first && curr && entity_before_patch(curr, se)) {
+ 		/*
+ 		 * Upon rescheduling, sched_class::put_prev_task() will place
+ 		 * 'current' within the tree based on its new key value.
+@@ -11452,6 +11654,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
++	cfs_rq->curr_latency_awareness = 0;
+ 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+ #ifndef CONFIG_64BIT
+ 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+@@ -11524,6 +11727,8 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ 		goto err;
+ 
+ 	tg->shares = NICE_0_LOAD;
++	tg->latency_awareness = 0;
++	// tg->parent = parent;
+ 
+ 	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8dccb34eb..1c4448a2d 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -383,6 +383,8 @@ struct task_group {
+ 	struct cfs_rq		**cfs_rq;
+ 	unsigned long		shares;
+ 
++	u64			latency_awareness;
++
+ 	/* A positive value indicates that this is a SCHED_IDLE group. */
+ 	int			idle;
+ 
+@@ -393,6 +395,7 @@ struct task_group {
+ 	 * will also be accessed at each tick.
+ 	 */
+ 	atomic_long_t		load_avg ____cacheline_aligned;
++	atomic_long_t		load_avg_ema ____cacheline_aligned;
+ #endif
+ #endif
+ 
+@@ -520,6 +523,8 @@ struct cfs_rq {
+ 	unsigned int		h_nr_running;      /* SCHED_{NORMAL,BATCH,IDLE} */
+ 	unsigned int		idle_nr_running;   /* SCHED_IDLE */
+ 	unsigned int		idle_h_nr_running; /* SCHED_IDLE */
++	unsigned int		curr_latency_awareness;
++	unsigned long		curr_pod_load_avg;
+ 
+ 	u64			exec_clock;
+ 	u64			min_vruntime;

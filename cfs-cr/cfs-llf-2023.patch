@@ -1,0 +1,1400 @@
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d58c0389e..a1ee73d0f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -10386,6 +10386,62 @@ static u64 cpu_shares_read_u64(struct cgroup_subsys_state *css,
+ 	return (u64) scale_load_down(tg->shares);
+ }
+ 
++static u64 cpu_latency_awareness_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return tg->latency_awareness;
++}
++
++static int cpu_latency_awareness_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        struct task_group *tg = css_tg(css);
++        tg->latency_awareness = value;
++        return 0;
++}
++
++static u64 cpu_load_avg_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return atomic_long_read(&tg->load_avg);;
++}
++
++static int cpu_load_avg_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        return 0;
++}
++
++static u64 cpu_load_avg_ema_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return atomic_long_read(&tg->load_avg_ema);
++}
++
++static int cpu_load_avg_ema_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        return 0;
++}
++
++static u64 cpu_slice_read_u64(struct cgroup_subsys_state *css,
++                               struct cftype *cft)
++{
++        struct task_group *tg = css_tg(css);
++        return tg->slice;
++}
++
++static int cpu_slice_write_u64(struct cgroup_subsys_state *css,
++                                struct cftype *cftype, u64 value)
++{
++        struct task_group *tg = css_tg(css);
++        tg->slice = value;
++        return 0;
++}
++
+ #ifdef CONFIG_CFS_BANDWIDTH
+ static DEFINE_MUTEX(cfs_constraints_mutex);
+ 
+@@ -10757,6 +10813,26 @@ static struct cftype cpu_legacy_files[] = {
+ 		.read_u64 = cpu_shares_read_u64,
+ 		.write_u64 = cpu_shares_write_u64,
+ 	},
++        {
++                .name = "latency_awareness",
++                .read_u64 = cpu_latency_awareness_read_u64,
++                .write_u64 = cpu_latency_awareness_write_u64,
++        },
++        {
++                .name = "load_avg",
++                .read_u64 = cpu_load_avg_read_u64,
++                .write_u64 = cpu_load_avg_write_u64,
++        },
++        {
++                .name = "load_avg_ema",
++                .read_u64 = cpu_load_avg_ema_read_u64,
++                .write_u64 = cpu_load_avg_ema_write_u64,
++        },
++        {
++                .name = "slice",
++                .read_u64 = cpu_slice_read_u64,
++                .write_u64 = cpu_slice_write_u64,
++        },
+ 	{
+ 		.name = "idle",
+ 		.read_s64 = cpu_idle_read_s64,
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index a68482d66..9b66db665 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -124,6 +124,148 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
+ 
+ const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
+ 
++//mechanisms to mitigate contention
++unsigned int sched_disable_calc_group_shares = 0;
++
++// sched_entity_before_policy == 0 entity_before(a,b);
++// sched_entity_before_policy == 1 entity_before_tg_load_avg(a,b);
++// sched_entity_before_policy == 2 entity_before_se_load_avg_least(a,b);
++// sched_entity_before_policy == 3 entity_before_static_priority(a,b);
++// sched_entity_before_policy == 4 entity_before_relaxed_fairness(a,b);
++// sched_entity_before_policy == 40  entity_before_unfair(a,b);
++// sched_entity_before_policy == 20  entity_before_se_load_avg_most(a,b);
++unsigned int sched_entity_before_policy = 0;
++
++unsigned int sched_tg_load_avg_sticky;
++unsigned int sched_epochs_before_next_tg_load_avg_update;
++
++unsigned int sched_slice_static_period = 0;
++unsigned int sched_disable_vruntime_preemption = 0;
++
++unsigned int sched_tg_load_avg_ema = 0;
++unsigned int sched_tg_load_avg_ema_window = 0;
++
++unsigned int sched_check_preempt_wakeup_relaxed = 0;
++unsigned int sched_check_preempt_wakeup_latency_awareness = 0;
++unsigned int sched_cpu_has_higher_load_task = 0;
++unsigned int sched_cpu_has_higher_load_task_all = 0;
++
++unsigned int sched_cfs_rq_is_idle_if_no_latency_awareness = 0;
++
++#ifdef CONFIG_SYSCTL
++static int sched_latency_awareness_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos);
++static struct ctl_table sched_cfs_latency_awareness_sysctls[] = {
++        {
++                .procname       = "sched_disable_calc_group_shares",
++                .data           = &sched_disable_calc_group_shares,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_entity_before_policy",
++                .data           = &sched_entity_before_policy,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_tg_load_avg_sticky",
++                .data           = &sched_tg_load_avg_sticky,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_epochs_before_next_tg_load_avg_update",
++                .data           = &sched_epochs_before_next_tg_load_avg_update,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_tg_load_avg_ema",
++                .data           = &sched_tg_load_avg_ema,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_tg_load_avg_ema_window",
++                .data           = &sched_tg_load_avg_ema_window,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_slice_static_period",
++                .data           = &sched_slice_static_period,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_disable_vruntime_preemption",
++                .data           = &sched_disable_vruntime_preemption,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_check_preempt_wakeup_relaxed",
++                .data           = &sched_check_preempt_wakeup_relaxed,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_check_preempt_wakeup_latency_awareness",
++                .data           = &sched_check_preempt_wakeup_latency_awareness,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_cpu_has_higher_load_task",
++                .data           = &sched_cpu_has_higher_load_task,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_cpu_has_higher_load_task_all",
++                .data           = &sched_cpu_has_higher_load_task_all,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++        {
++                .procname       = "sched_cfs_rq_is_idle_if_no_latency_awareness",
++                .data           = &sched_cfs_rq_is_idle_if_no_latency_awareness,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_latency_awareness_handler,
++        },
++ {}
++};
++
++static int __init sched_cfs_latency_awareness_sysctl_init(void)
++{
++        register_sysctl_init("kernel", sched_cfs_latency_awareness_sysctls);
++        return 0;
++}
++late_initcall(sched_cfs_latency_awareness_sysctl_init);
++#endif
++
++static int sched_latency_awareness_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos)
++{
++        int ret;
++        ret = proc_dointvec(table, write, buffer, lenp, ppos);
++        return ret;
++}
++
+ int sched_thermal_decay_shift;
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+@@ -478,6 +620,9 @@ static int tg_is_idle(struct task_group *tg)
+ 
+ static int cfs_rq_is_idle(struct cfs_rq *cfs_rq)
+ {
++	if (sched_cfs_rq_is_idle_if_no_latency_awareness){
++		return cfs_rq->tg->latency_awareness == 0;
++	}
+ 	return cfs_rq->idle > 0;
+ }
+ 
+@@ -573,6 +718,139 @@ static inline bool entity_before(struct sched_entity *a,
+ 	return (s64)(a->vruntime - b->vruntime) < 0;
+ }
+ 
++//CFS will always put the task back at the end of the queue
++//This might be seen as an equivelent to an RR policy
++//This can be compared against contention within SCHED_RR
++static inline bool entity_before_relaxed_fairness(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	return false;
++}
++
++//CFS will put the the task at the front of the queue
++//This might be seen as an equivelent to FIFO policy
++//This will probably not work because of having pick_next_entity before put_prev_entity
++static inline bool entity_before_unfair(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	return true;
++}
++
++static inline bool entity_before_se_load_avg_least(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	return (s64) a->avg.load_avg - b->avg.load_avg < 0;
++}
++
++//this should demonstrate the largest margin of improvement for high-group
++static inline bool entity_before_se_load_avg_most(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	return (s64) a->avg.load_avg - b->avg.load_avg > 0;
++}
++
++unsigned int get_static_prio(struct sched_entity *a){
++	unsigned int prio;
++	if (entity_is_task(a)) a = a->parent;
++	while (a){
++		prio = group_cfs_rq(a)->tg->slice;
++		if (prio) {
++			return prio;
++		}
++		a = a->parent;
++	}
++	return 0;
++}
++
++//ordering tasks based on the static priority of their parent tasks
++//this should demonstrate the largest margin of improvement
++static inline bool entity_before_static_priority(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	unsigned int prio_a, prio_b;
++	prio_a = get_static_prio(a);
++	prio_b = get_static_prio(b);
++
++	if (!prio_a && !prio_b)
++		return false;
++	else
++		return (s64) prio_a - prio_b > 0;
++}
++
++//this function is supposed to compare entities within the same queue
++//this is invoked recursively starting from the top down to the bottom of the cgroup tree
++static inline bool entity_before_tg_load_avg(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	struct task_group *tga, *tgb;
++	long tga_load, tgb_load;
++
++	if (!entity_is_task(a) && !entity_is_task(b)){
++
++		tga = group_cfs_rq(a)->tg;
++		tgb = group_cfs_rq(b)->tg;
++
++		//only adjust default policy for pod-level entities
++		if (tga->latency_awareness && tgb->latency_awareness) {
++
++			if (tga->latency_awareness < tgb->latency_awareness)
++				return true; //a has lower load, then goes before
++
++			else if (tga->latency_awareness > tgb->latency_awareness)
++				return false; //a is not lower load, so does not go before
++
++			//with gradual priority per each pod, this only applies to containers
++			//i.e. user-container and queue-proxy have the same priority
++			else //if (tga->latency_awareness == tgb->latency_awareness)
++				return entity_before(a,b); //if equal priority, revert to default policy
++
++		} else return entity_before(a,b);
++
++	} else return entity_before(a,b);
++}
++
++static inline bool entity_before_tg_load_avg_dynamic(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	struct task_group *tga, *tgb;
++	long tga_load, tgb_load;
++
++	if (!entity_is_task(a) && !entity_is_task(b)){
++
++		tga = group_cfs_rq(a)->tg;
++		tgb = group_cfs_rq(b)->tg;
++
++		//only adjust default policy for pod-level entities
++		if ((tga->latency_awareness) && (tgb->latency_awareness)) {
++
++			tga_load = atomic_long_read(&tga->load_avg_ema);
++			tgb_load = atomic_long_read(&tgb->load_avg_ema);
++
++			if (tga_load < tgb_load) //we can install a threshold here
++				return true; //a has lower load, then goes before
++
++			else //if (tga_load >= tgb_load)
++				return false; //a is not lower load, so does not go before
++
++		} else return entity_before(a,b);
++
++	} else return entity_before(a,b);
++}
++
++static inline bool entity_before_patch(struct sched_entity *a,
++				struct sched_entity *b)
++{
++	if (sched_entity_before_policy == 1) return entity_before_tg_load_avg(a,b);
++	else if (sched_entity_before_policy == 100) return entity_before_tg_load_avg_dynamic(a,b);
++	else if (sched_entity_before_policy == 2) return entity_before_se_load_avg_least(a,b);
++	else if (sched_entity_before_policy == 3) return entity_before_static_priority(a,b);
++	else if (sched_entity_before_policy == 4) return entity_before_relaxed_fairness(a,b);
++
++	else if (sched_entity_before_policy == 40) return entity_before_unfair(a,b);
++	else if (sched_entity_before_policy == 20) return entity_before_se_load_avg_most(a,b);
++	else return entity_before(a,b);
++}
++
+ #define __node_2_se(node) \
+ 	rb_entry((node), struct sched_entity, run_node)
+ 
+@@ -609,7 +887,7 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 
+ static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
+ {
+-	return entity_before(__node_2_se(a), __node_2_se(b));
++	return entity_before_patch(__node_2_se(a), __node_2_se(b));
+ }
+ 
+ /*
+@@ -754,6 +1032,48 @@ static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 	return slice;
+ }
+ 
++static u64 slice_static_period(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	struct sched_entity *init_se = se;
++	unsigned int min_gran;
++	u64 slice, period;
++
++	struct load_weight *load;
++	struct load_weight lw;
++	struct cfs_rq *qcfs_rq;
++
++	qcfs_rq = cfs_rq_of(se);
++	load = &qcfs_rq->load;
++	if (unlikely(!se->on_rq)) {
++		lw = qcfs_rq->load;
++
++		update_load_add(&lw, se->load.weight);
++		load = &lw;
++	}
++
++	period = cfs_rq_of(se)->tg->slice;
++	slice = __calc_delta(period, se->load.weight, load);
++
++	if (sched_feat(BASE_SLICE)) {
++		if (se_is_idle(init_se) && !sched_idle_cfs_rq(cfs_rq))
++			min_gran = sysctl_sched_idle_min_granularity;
++		else
++			min_gran = sysctl_sched_min_granularity;
++
++		slice = max_t(u64, slice, min_gran);
++	}
++
++	return slice;
++}
++
++static u64 sched_slice_patched(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	if (sched_slice_static_period)
++		return slice_static_period(cfs_rq, se);
++	else
++		return sched_slice(cfs_rq, se);
++}
++
+ /*
+  * We calculate the vruntime slice of a to-be-inserted task.
+  *
+@@ -761,7 +1081,7 @@ static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+  */
+ static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ {
+-	return calc_delta_fair(sched_slice(cfs_rq, se), se);
++	return calc_delta_fair(sched_slice_patched(cfs_rq, se), se);
+ }
+ 
+ #include "pelt.h"
+@@ -3265,7 +3585,9 @@ static void update_cfs_group(struct sched_entity *se)
+ 	if (likely(se->load.weight == shares))
+ 		return;
+ #else
++	if (!sched_disable_calc_group_shares)
+ 	shares   = calc_group_shares(gcfs_rq);
++	else shares = READ_ONCE(gcfs_rq->tg->shares);
+ #endif
+ 
+ 	reweight_entity(cfs_rq_of(se), se, shares);
+@@ -3374,6 +3696,7 @@ static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ {
+ 	long delta = cfs_rq->avg.load_avg - cfs_rq->tg_load_avg_contrib;
++	struct task_group *tg = cfs_rq->tg;
+ 
+ 	/*
+ 	 * No need to update load_avg for root_task_group as it is not used.
+@@ -3384,6 +3707,22 @@ static inline void update_tg_load_avg(struct cfs_rq *cfs_rq)
+ 	if (abs(delta) > cfs_rq->tg_load_avg_contrib / 64) {
+ 		atomic_long_add(delta, &cfs_rq->tg->load_avg);
+ 		cfs_rq->tg_load_avg_contrib = cfs_rq->avg.load_avg;
++
++		if (sched_tg_load_avg_sticky){
++			if (tg->epochs_before_next_load_avg_update == 0){
++				tg->load_avg_sticky = atomic_long_read(&tg->load_avg);
++				tg->epochs_before_next_load_avg_update = sched_epochs_before_next_tg_load_avg_update;
++			} else {
++				tg->epochs_before_next_load_avg_update -= 1;
++			}
++		}
++	}
++
++	if (sched_tg_load_avg_ema){
++		long prev = atomic_long_read(&tg->load_avg_ema);
++		long curr = atomic_long_read(&tg->load_avg);
++		long delta = ((((curr - prev)*2))/(1+sched_tg_load_avg_ema_window)); //+ prev;
++		atomic_long_add(delta, &tg->load_avg_ema);
+ 	}
+ }
+ 
+@@ -4477,7 +4816,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	struct sched_entity *se;
+ 	s64 delta;
+ 
+-	ideal_runtime = sched_slice(cfs_rq, curr);
++	ideal_runtime = sched_slice_patched(cfs_rq, curr);
+ 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+ 	if (delta_exec > ideal_runtime) {
+ 		resched_curr(rq_of(cfs_rq));
+@@ -4497,6 +4836,9 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	if (delta_exec < sysctl_sched_min_granularity)
+ 		return;
+ 
++	if (sched_disable_vruntime_preemption)
++		return;
++
+ 	se = __pick_first_entity(cfs_rq);
+ 	delta = curr->vruntime - se->vruntime;
+ 
+@@ -4565,7 +4907,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	 * If curr is set we have to see if its left of the leftmost entity
+ 	 * still in the tree, provided there was anything in the tree at all.
+ 	 */
+-	if (!left || (curr && entity_before(curr, left)))
++	if (!left || (curr && entity_before_patch(curr, left)))
+ 		left = curr;
+ 
+ 	se = left; /* ideally we run the leftmost entity */
+@@ -4581,7 +4923,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 			second = __pick_first_entity(cfs_rq);
+ 		} else {
+ 			second = __pick_next_entity(se);
+-			if (!second || (curr && entity_before(curr, second)))
++			if (!second || (curr && entity_before_patch(curr, second)))
+ 				second = curr;
+ 		}
+ 
+@@ -5556,7 +5898,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+ 	SCHED_WARN_ON(task_rq(p) != rq);
+ 
+ 	if (rq->cfs.h_nr_running > 1) {
+-		u64 slice = sched_slice(cfs_rq, se);
++		u64 slice = sched_slice_patched(cfs_rq, se);
+ 		u64 ran = se->sum_exec_runtime - se->prev_sum_exec_runtime;
+ 		s64 delta = slice - ran;
+ 
+@@ -5637,6 +5979,140 @@ static int sched_idle_cpu(int cpu)
+ }
+ #endif
+ 
++static int cpu_has_higher_load_task_dynamic(struct task_struct *p, int target, int path)
++{
++	//candidate cpu
++	struct rq *rq = cpu_rq(target);
++
++	unsigned int curr_pod_load_avg = rq->cfs.curr_pod_load_avg;
++
++	//if the currently running entity is not latency aware
++	//then this CPU is defnitely a good target
++	if (!curr_pod_load_avg) return 1;
++
++	//otherwise, we should compare the priority of curr with that of p
++	struct sched_entity *se = &p->se;
++
++	//once you encounter a tg with latency awareness value, do the compare and exit
++	struct task_group *container_tg = cfs_rq_of(se)->tg;
++	struct task_group *pod_tg;
++
++	if (container_tg) {
++		pod_tg = container_tg->parent; //tg corresponding to a pod
++		if (pod_tg && (pod_tg->latency_awareness)){
++			if (atomic_long_read(&pod_tg->load_avg_ema) < curr_pod_load_avg)
++				return 1;
++		} else return 0;
++	}
++	return 0;
++}
++
++//in order for this to work, I need to coordinate as well in the two locations
++//1) check_preempt_wakeup (using set_next_buddy to give priority to least loaded task)
++//2) entity_before (keeping all most loaded task at the back of the queue)
++//         (or via WEIGHT_IDLEPRIO or calc_delta_fair)
++//3) sched_slice (increasing the minimum granularity of tasks)
++
++//please refer to get_experiment_cfspatched_iteration6
++
++static int cpu_has_higher_load_task(struct task_struct *p, int target, int path)
++{
++	if (!sched_cpu_has_higher_load_task) return 0;
++
++	if (sched_cpu_has_higher_load_task == 100)
++		return cpu_has_higher_load_task_dynamic(p,target,path);
++
++	//candidate cpu
++	struct rq *rq = cpu_rq(target);
++
++	unsigned int curr_latency_awareness = rq->cfs.curr_latency_awareness;
++
++	//if the currently running entity is not latency aware
++	//then this CPU is defnitely a good target
++	if (!curr_latency_awareness) return 1;
++
++	//otherwise, we should compare the priority of curr with that of p
++	struct sched_entity *se = &p->se;
++
++	//once you encounter a tg with latency awareness value, do the compare and exit
++	struct task_group *container_tg = cfs_rq_of(se)->tg;
++	struct task_group *pod_tg;
++
++	if (container_tg) {
++		pod_tg = container_tg->parent; //tg corresponding to a pod
++		if (pod_tg && (pod_tg->latency_awareness)){
++			if (pod_tg->latency_awareness < curr_latency_awareness)
++				return 1;
++		} else return 0;
++	}
++	// if (tg && tg->latency_awareness){
++
++	// 	//if p has a priority higher than the current, then choose this CPU
++	// 	//lower value is higher priority (i.e. lower load)
++	// 	if (tg->latency_awareness < curr_latency_awareness)
++	// 		return 1;
++	// }
++
++	return 0;
++}
++
++/*static int cpu_has_higher_load_task(struct task_struct *p, int target, int path)
++{
++
++	if (!sched_cpu_has_higher_load_task) return 0;
++
++	//exit criteria
++	//we first check each path independently to see which are working
++	if (!sched_cpu_has_higher_load_task_all){
++		//ignore this path if this is not the one we want to test
++		if (path != sched_cpu_has_higher_load_task) return 0;
++	} else {
++		//only consider paths up to the path number we want to test
++		if (path > sched_cpu_has_higher_load_task) return 0;
++	}
++
++
++	//candidate cpu
++	struct rq *rq = cpu_rq(target);
++
++	// rq->cfs->curr
++	// struct cfs_rq *cfs_rq = &rq->cfs;
++	// struct sched_entity *curr = cfs_rq->curr, *pse = &p->se;
++
++	// rq->curr
++	struct task_struct *curr = rq->curr;
++	if (!curr)
++		return 0;
++	if (curr->sched_class != &fair_sched_class)
++		return 0;
++
++	struct sched_entity *se = &curr->se, *pse = &p->se;
++	if (!se) return 0;
++	if (!pse) return 0;
++
++	//walkup the CFS tree until you find the entities that belong to the same cfs_rq
++	find_matching_se(&se, &pse);
++	if (!se) return 0;
++	if (!pse) return 0;
++
++	if (!entity_is_task(se) && !entity_is_task(pse)){
++
++		struct task_group *ctg, *wtg;
++		//latency-awareness patch
++		ctg = group_cfs_rq(se)->tg;
++		wtg = group_cfs_rq(pse)->tg;
++
++		//only choose a target cpu if it has a lower priority task (i.e. higher load)
++		if ((ctg->latency_awareness &&  wtg->latency_awareness) &&
++			(ctg->latency_awareness > wtg->latency_awareness))
++			return 1;
++		else
++			return 0;
++
++	} else return 0;
++}*/
++
++
+ /*
+  * The enqueue_task method is called before nr_running is
+  * increased. Here we update the fair scheduling stats and
+@@ -6087,7 +6563,7 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
+ 		if (!sched_core_cookie_match(rq, p))
+ 			continue;
+ 
+-		if (sched_idle_cpu(i))
++		if (sched_idle_cpu(i) || cpu_has_higher_load_task(p,i,20))
+ 			return i;
+ 
+ 		if (available_idle_cpu(i)) {
+@@ -6178,7 +6654,7 @@ static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p
+ 
+ static inline int __select_idle_cpu(int cpu, struct task_struct *p)
+ {
+-	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu)) &&
++	if ((available_idle_cpu(cpu) || sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,16)) && //cpu_has_higher_load_task 6.2
+ 	    sched_cpu_cookie_match(cpu_rq(cpu), p))
+ 		return cpu;
+ 
+@@ -6249,13 +6725,13 @@ static int select_idle_core(struct task_struct *p, int core, struct cpumask *cpu
+ 	int cpu;
+ 
+ 	if (!static_branch_likely(&sched_smt_present))
+-		return __select_idle_cpu(core, p);
++		return __select_idle_cpu(core, p); //cpu_has_higher_load_task 6.1
+ 
+ 	for_each_cpu(cpu, cpu_smt_mask(core)) {
+ 		if (!available_idle_cpu(cpu)) {
+ 			idle = false;
+ 			if (*idle_cpu == -1) {
+-				if (sched_idle_cpu(cpu) && cpumask_test_cpu(cpu, p->cpus_ptr)) {
++				if ((sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,17)) && cpumask_test_cpu(cpu, p->cpus_ptr)) { //cpu_has_higher_load_task 6.1
+ 					*idle_cpu = cpu;
+ 					break;
+ 				}
+@@ -6285,7 +6761,7 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
+ 		if (!cpumask_test_cpu(cpu, p->cpus_ptr) ||
+ 		    !cpumask_test_cpu(cpu, sched_domain_span(sd)))
+ 			continue;
+-		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu))
++		if (available_idle_cpu(cpu) || sched_idle_cpu(cpu) || cpu_has_higher_load_task(p, cpu,15)) //cpu_has_higher_load_task 5
+ 			return cpu;
+ 	}
+ 
+@@ -6365,14 +6841,14 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, bool
+ 
+ 	for_each_cpu_wrap(cpu, cpus, target + 1) {
+ 		if (has_idle_core) {
+-			i = select_idle_core(p, cpu, cpus, &idle_cpu);
++			i = select_idle_core(p, cpu, cpus, &idle_cpu); ////cpu_has_higher_load_task 6.1
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 
+ 		} else {
+ 			if (!--nr)
+ 				return -1;
+-			idle_cpu = __select_idle_cpu(cpu, p);
++			idle_cpu = __select_idle_cpu(cpu, p); //cpu_has_higher_load_task 6.2
+ 			if ((unsigned int)idle_cpu < nr_cpumask_bits)
+ 				break;
+ 		}
+@@ -6416,7 +6892,7 @@ select_idle_capacity(struct task_struct *p, struct sched_domain *sd, int target)
+ 	for_each_cpu_wrap(cpu, cpus, target) {
+ 		unsigned long cpu_cap = capacity_of(cpu);
+ 
+-		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu))
++		if (!available_idle_cpu(cpu) && !sched_idle_cpu(cpu)) //cpu_has_higher_load_task 4 ignore_sched_idle_cpu
+ 			continue;
+ 		if (fits_capacity(task_util, cpu_cap))
+ 			return cpu;
+@@ -6462,7 +6938,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 */
+ 	lockdep_assert_irqs_disabled();
+ 
+-	if ((available_idle_cpu(target) || sched_idle_cpu(target)) &&
++	if ((available_idle_cpu(target) || sched_idle_cpu(target) || cpu_has_higher_load_task(p, target,11)) && //cpu_has_higher_load_task 1
+ 	    asym_fits_capacity(task_util, target))
+ 		return target;
+ 
+@@ -6470,7 +6946,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	 * If the previous CPU is cache affine and idle, don't be stupid:
+ 	 */
+ 	if (prev != target && cpus_share_cache(prev, target) &&
+-	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) &&
++	    (available_idle_cpu(prev) || sched_idle_cpu(prev)) && //cpu_has_higher_load_task 2 ignore_sched_idle_cpu
+ 	    asym_fits_capacity(task_util, prev))
+ 		return prev;
+ 
+@@ -6496,7 +6972,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 	if (recent_used_cpu != prev &&
+ 	    recent_used_cpu != target &&
+ 	    cpus_share_cache(recent_used_cpu, target) &&
+-	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
++	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu) || cpu_has_higher_load_task(p, recent_used_cpu,13)) && //cpu_has_higher_load_task 3
+ 	    cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr) &&
+ 	    asym_fits_capacity(task_util, recent_used_cpu)) {
+ 		return recent_used_cpu;
+@@ -6517,7 +6993,7 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		 * capacity path.
+ 		 */
+ 		if (sd) {
+-			i = select_idle_capacity(p, sd, target);
++			i = select_idle_capacity(p, sd, target); //cpu_has_higher_load_task 4
+ 			return ((unsigned)i < nr_cpumask_bits) ? i : target;
+ 		}
+ 	}
+@@ -6530,13 +7006,13 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ 		has_idle_core = test_idle_cores(target, false);
+ 
+ 		if (!has_idle_core && cpus_share_cache(prev, target)) {
+-			i = select_idle_smt(p, sd, prev);
++			i = select_idle_smt(p, sd, prev); //cpu_has_higher_load_task 5
+ 			if ((unsigned int)i < nr_cpumask_bits)
+ 				return i;
+ 		}
+ 	}
+ 
+-	i = select_idle_cpu(p, sd, has_idle_core, target);
++	i = select_idle_cpu(p, sd, has_idle_core, target); //cpu_has_higher_load_task 6
+ 	if ((unsigned)i < nr_cpumask_bits)
+ 		return i;
+ 
+@@ -7198,6 +7674,43 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ 	if (cse_is_idle != pse_is_idle)
+ 		return;
+ 
++	if (sched_check_preempt_wakeup_latency_awareness == 1){
++
++		if (!entity_is_task(se) && !entity_is_task(pse)){
++
++			struct task_group *ctg, *wtg;
++			//latency-awareness patch
++			ctg = group_cfs_rq(se)->tg;
++			wtg = group_cfs_rq(pse)->tg;
++
++			//only preempt the current task if it has a lower priority (i.e. higher load)
++			if ((ctg->latency_awareness &&  wtg->latency_awareness) &&
++				(ctg->latency_awareness > wtg->latency_awareness))
++				goto preempt;
++
++		}
++	}
++
++	if (sched_check_preempt_wakeup_latency_awareness == 100){
++		if (!entity_is_task(se) && !entity_is_task(pse)){
++			struct task_group *ctg, *wtg;
++			//latency-awareness patch
++			ctg = group_cfs_rq(se)->tg;
++			wtg = group_cfs_rq(pse)->tg;
++
++			//only preempt the current task if it has a lower priority (i.e. higher load)
++			if (((ctg->latency_awareness) &&  (wtg->latency_awareness))){
++
++				long ctg_load = atomic_long_read(&ctg->load_avg_ema);
++				long wtg_load = atomic_long_read(&wtg->load_avg_ema);
++
++				if (ctg_load > wtg_load) //we can install a threshold here
++					goto preempt; //current has higher load, so preempt it!
++			}
++		}
++	}
++
++	//this mechanism might be necessary to prevent low loaded tasks from taking over the system
+ 	update_curr(cfs_rq_of(se));
+ 	if (wakeup_preempt_entity(se, pse) == 1) {
+ 		/*
+@@ -7266,10 +7779,14 @@ struct task_struct *
+ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ {
+ 	struct cfs_rq *cfs_rq = &rq->cfs;
++	struct cfs_rq *cfs_rq_init = cfs_rq;
+ 	struct sched_entity *se;
+ 	struct task_struct *p;
+ 	int new_tasks;
+ 
++	cfs_rq_init->curr_latency_awareness = 0;
++	cfs_rq_init->curr_pod_load_avg = 0;
++
+ again:
+ 	if (!sched_fair_runnable(rq))
+ 		goto idle;
+@@ -7317,6 +7834,12 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 			}
+ 		}
+ 
++		if (cfs_rq->tg->latency_awareness && !cfs_rq_init->curr_latency_awareness) {
++			//we assume the first latency awwareness flag from the top corresponds to a pod
++			cfs_rq_init->curr_pod_load_avg = atomic_long_read(&cfs_rq->tg->load_avg_ema);
++			cfs_rq_init->curr_latency_awareness = cfs_rq->tg->latency_awareness;
++		}
++
+ 		se = pick_next_entity(cfs_rq, curr);
+ 		cfs_rq = group_cfs_rq(se);
+ 	} while (cfs_rq);
+@@ -10316,7 +10839,7 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ {
+ 	int continue_balancing = 1;
+ 	int cpu = rq->cpu;
+-	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
++	int busy = idle != CPU_IDLE && !sched_idle_cpu(cpu); //ignore_sched_idle_cpu
+ 	unsigned long interval;
+ 	struct sched_domain *sd;
+ 	/* Earliest time when we have to do rebalance again */
+@@ -10361,7 +10884,7 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 				 * state even if we migrated tasks. Update it.
+ 				 */
+ 				idle = idle_cpu(cpu) ? CPU_IDLE : CPU_NOT_IDLE;
+-				busy = idle != CPU_IDLE && !sched_idle_cpu(cpu);
++				busy = idle != CPU_IDLE && !sched_idle_cpu(cpu); //ignore_sched_idle_cpu
+ 			}
+ 			sd->last_balance = jiffies;
+ 			interval = get_sd_balance_interval(sd, busy);
+@@ -11085,7 +11608,7 @@ static void rq_offline_fair(struct rq *rq)
+ static inline bool
+ __entity_slice_used(struct sched_entity *se, int min_nr_tasks)
+ {
+-	u64 slice = sched_slice(cfs_rq_of(se), se);
++	u64 slice = sched_slice_patched(cfs_rq_of(se), se);
+ 	u64 rtime = se->sum_exec_runtime - se->prev_sum_exec_runtime;
+ 
+ 	return (rtime * min_nr_tasks > slice);
+@@ -11244,7 +11767,7 @@ static void task_fork_fair(struct task_struct *p)
+ 	}
+ 	place_entity(cfs_rq, se, 1);
+ 
+-	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
++	if (sysctl_sched_child_runs_first && curr && entity_before_patch(curr, se)) {
+ 		/*
+ 		 * Upon rescheduling, sched_class::put_prev_task() will place
+ 		 * 'current' within the tree based on its new key value.
+@@ -11452,6 +11975,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
+ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
++	cfs_rq->curr_latency_awareness = 0;
+ 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+ #ifndef CONFIG_64BIT
+ 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+@@ -11524,6 +12048,11 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ 		goto err;
+ 
+ 	tg->shares = NICE_0_LOAD;
++	tg->slice = sysctl_sched_latency;
++	tg->latency_awareness = 0;
++	tg->load_avg_sticky = 0;
++	tg->epochs_before_next_load_avg_update = sched_epochs_before_next_tg_load_avg_update;
++	// tg->parent = parent;
+ 
+ 	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
+ 
+@@ -11778,7 +12307,7 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
+ 	 * idle runqueue:
+ 	 */
+ 	if (rq->cfs.load.weight)
+-		rr_interval = NS_TO_JIFFIES(sched_slice(cfs_rq_of(se), se));
++		rr_interval = NS_TO_JIFFIES(sched_slice_patched(cfs_rq_of(se), se));
+ 
+ 	return rr_interval;
+ }
+diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
+index 0f3107682..ba7632547 100644
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@ -24,6 +24,65 @@
+  *  Author: Vincent Guittot <vincent.guittot@linaro.org>
+  */
+ 
++#ifdef CONFIG_SYSCTL
++static int sched_cfspatched_pelt_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos);
++static struct ctl_table sched_cfs_pelt_sysctls[] = {
++        {
++                .procname       = "schedpatched_se_weight_neutral_pelt",
++                .data           = &schedpatched_se_weight_neutral_pelt,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_cfspatched_pelt_handler,
++        },
++        {
++                .procname       = "schedpatched_pelt_segment_length",
++                .data           = &schedpatched_pelt_segment_length,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_cfspatched_pelt_handler,
++        },
++        {
++                .procname       = "schedpatched_pelt_load_avg_period",
++                .data           = &schedpatched_pelt_load_avg_period,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_cfspatched_pelt_handler,
++        },
++        {
++                .procname       = "schedpatched_pelt_load_avg_max",
++                .data           = &schedpatched_pelt_load_avg_max,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_cfspatched_pelt_handler,
++        },
++        {
++                .procname       = "schedpatched_pelt_min_divider",
++                .data           = &schedpatched_pelt_min_divider,
++                .maxlen         = sizeof(unsigned int),
++                .mode           = 0644,
++                .proc_handler   = sched_cfspatched_pelt_handler,
++        },
++
++ {}
++};
++
++static int __init sched_cfs_pelt_sysctl_init(void)
++{
++        register_sysctl_init("kernel", sched_cfs_pelt_sysctls);
++        return 0;
++}
++late_initcall(sched_cfs_pelt_sysctl_init);
++#endif
++
++static int sched_cfspatched_pelt_handler(struct ctl_table *table, int write, void *buffer,
++                size_t *lenp, loff_t *ppos)
++{
++        int ret;
++        ret = proc_dointvec(table, write, buffer, lenp, ppos);
++        return ret;
++}
++
+ /*
+  * Approximate:
+  *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
+@@ -32,7 +91,7 @@ static u64 decay_load(u64 val, u64 n)
+ {
+ 	unsigned int local_n;
+ 
+-	if (unlikely(n > LOAD_AVG_PERIOD * 63))
++	if (unlikely(n > schedpatched_pelt_load_avg_period * 63))
+ 		return 0;
+ 
+ 	/* after bounds checking we can collapse to 32-bit */
+@@ -45,9 +104,9 @@ static u64 decay_load(u64 val, u64 n)
+ 	 *
+ 	 * To achieve constant time decay_load.
+ 	 */
+-	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
+-		val >>= local_n / LOAD_AVG_PERIOD;
+-		local_n %= LOAD_AVG_PERIOD;
++	if (unlikely(local_n >= schedpatched_pelt_load_avg_period)) {
++		val >>= local_n / schedpatched_pelt_load_avg_period;
++		local_n %= schedpatched_pelt_load_avg_period;
+ 	}
+ 
+ 	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
+@@ -72,7 +131,7 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
+ 	 *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
+ 	 *              n=0        n=p
+ 	 */
+-	c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
++	c2 = schedpatched_pelt_load_avg_max - decay_load(schedpatched_pelt_load_avg_max, periods) - schedpatched_pelt_segment_length;
+ 
+ 	return c1 + c2 + c3;
+ }
+@@ -106,7 +165,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
+ 	u64 periods;
+ 
+ 	delta += sa->period_contrib;
+-	periods = delta / 1024; /* A period is 1024us (~1ms) */
++	periods = delta / schedpatched_pelt_segment_length; /* A period is 1024us (~1ms) */
+ 
+ 	/*
+ 	 * Step 1: decay old *_sum if we crossed period boundaries.
+@@ -120,7 +179,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
+ 		/*
+ 		 * Step 2
+ 		 */
+-		delta %= 1024;
++		delta %= schedpatched_pelt_segment_length;
+ 		if (load) {
+ 			/*
+ 			 * This relies on the:
+@@ -133,7 +192,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
+ 			 * so no point in calculating it.
+ 			 */
+ 			contrib = __accumulate_pelt_segments(periods,
+-					1024 - sa->period_contrib, delta);
++					schedpatched_pelt_segment_length - sa->period_contrib, delta);
+ 		}
+ 	}
+ 	sa->period_contrib = delta;
+@@ -292,10 +351,19 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
+  *   load_avg = \Sum se->avg.load_avg
+  */
+ 
++static inline long se_weight_neutral(struct sched_entity *se)
++{
++        if (!schedpatched_se_weight_neutral_pelt)
++        return scale_load_down(se->load.weight);
++        else
++        return scale_load_down(NICE_0_LOAD);
++}
++
++
+ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
+ {
+ 	if (___update_load_sum(now, &se->avg, 0, 0, 0)) {
+-		___update_load_avg(&se->avg, se_weight(se));
++		___update_load_avg(&se->avg, se_weight_neutral(se));
+ 		trace_pelt_se_tp(se);
+ 		return 1;
+ 	}
+@@ -308,7 +376,7 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
+ 	if (___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se),
+ 				cfs_rq->curr == se)) {
+ 
+-		___update_load_avg(&se->avg, se_weight(se));
++		___update_load_avg(&se->avg, se_weight_neutral(se));
+ 		cfs_se_util_change(&se->avg);
+ 		trace_pelt_se_tp(se);
+ 		return 1;
+diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
+index c336f5f48..7337119b0 100644
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -1,6 +1,13 @@
+ #ifdef CONFIG_SMP
+ #include "sched-pelt.h"
+ 
++static unsigned int schedpatched_se_weight_neutral_pelt = 0;
++static unsigned int schedpatched_pelt_segment_length = 1024;
++static unsigned int schedpatched_pelt_load_avg_period = 32;
++static unsigned int schedpatched_pelt_load_avg_max = 47742;
++static unsigned int schedpatched_pelt_min_divider = (47742 - 1024);
++
++
+ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se);
+ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se);
+ int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq);
+@@ -37,11 +44,11 @@ update_irq_load_avg(struct rq *rq, u64 running)
+ }
+ #endif
+ 
+-#define PELT_MIN_DIVIDER	(LOAD_AVG_MAX - 1024)
++#define PELT_MIN_DIVIDER	(schedpatched_pelt_load_avg_max - 1024)
+ 
+ static inline u32 get_pelt_divider(struct sched_avg *avg)
+ {
+-	return PELT_MIN_DIVIDER + avg->period_contrib;
++	return schedpatched_pelt_min_divider + avg->period_contrib;
+ }
+ 
+ static inline void cfs_se_util_change(struct sched_avg *avg)
+@@ -114,7 +121,7 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
+  */
+ static inline void update_idle_rq_clock_pelt(struct rq *rq)
+ {
+-	u32 divider = ((LOAD_AVG_MAX - 1024) << SCHED_CAPACITY_SHIFT) - LOAD_AVG_MAX;
++	u32 divider = ((schedpatched_pelt_load_avg_max - 1024) << SCHED_CAPACITY_SHIFT) - schedpatched_pelt_load_avg_max;
+ 	u32 util_sum = rq->cfs.avg.util_sum;
+ 	util_sum += rq->avg_rt.util_sum;
+ 	util_sum += rq->avg_dl.util_sum;
+diff --git a/kernel/sched/sched-pelt.h b/kernel/sched/sched-pelt.h
+index c529706be..13f2dc433 100644
+--- a/kernel/sched/sched-pelt.h
++++ b/kernel/sched/sched-pelt.h
+@@ -2,12 +2,205 @@
+ /* Generated by Documentation/scheduler/sched-pelt; do not modify. */
+ 
+ static const u32 runnable_avg_yN_inv[] __maybe_unused = {
+-	0xffffffff, 0xfa83b2da, 0xf5257d14, 0xefe4b99a, 0xeac0c6e6, 0xe5b906e6,
+-	0xe0ccdeeb, 0xdbfbb796, 0xd744fcc9, 0xd2a81d91, 0xce248c14, 0xc9b9bd85,
+-	0xc5672a10, 0xc12c4cc9, 0xbd08a39e, 0xb8fbaf46, 0xb504f333, 0xb123f581,
+-	0xad583ee9, 0xa9a15ab4, 0xa5fed6a9, 0xa2704302, 0x9ef5325f, 0x9b8d39b9,
+-	0x9837f050, 0x94f4efa8, 0x91c3d373, 0x8ea4398a, 0x8b95c1e3, 0x88980e80,
+-	0x85aac367, 0x82cd8698,
++        0xffffffff, 0xfa83b2da, 0xf5257d14, 0xefe4b99a, 0xeac0c6e6, 0xe5b906e6,
++        0xe0ccdeeb, 0xdbfbb796, 0xd744fcc9, 0xd2a81d91, 0xce248c14, 0xc9b9bd85,
++        0xc5672a10, 0xc12c4cc9, 0xbd08a39e, 0xb8fbaf46, 0xb504f333, 0xb123f581,
++        0xad583ee9, 0xa9a15ab4, 0xa5fed6a9, 0xa2704302, 0x9ef5325f, 0x9b8d39b9,
++        0x9837f050, 0x94f4efa8, 0x91c3d373, 0x8ea4398a, 0x8b95c1e3, 0x88980e80,
++        0x85aac367, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698, 0x82cd8698,
++        0x82cd8698, 0x82cd8698,
+ };
+ 
+ #define LOAD_AVG_PERIOD 32
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8dccb34eb..42cfb1ad9 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -383,6 +383,12 @@ struct task_group {
+ 	struct cfs_rq		**cfs_rq;
+ 	unsigned long		shares;
+ 
++	u64			latency_awareness;
++
++	u64			slice;
++	long			load_avg_sticky;
++	unsigned long		epochs_before_next_load_avg_update;
++
+ 	/* A positive value indicates that this is a SCHED_IDLE group. */
+ 	int			idle;
+ 
+@@ -393,6 +399,8 @@ struct task_group {
+ 	 * will also be accessed at each tick.
+ 	 */
+ 	atomic_long_t		load_avg ____cacheline_aligned;
++	atomic_long_t           max_load_avg ____cacheline_aligned;
++	atomic_long_t		load_avg_ema ____cacheline_aligned;
+ #endif
+ #endif
+ 
+@@ -520,6 +528,8 @@ struct cfs_rq {
+ 	unsigned int		h_nr_running;      /* SCHED_{NORMAL,BATCH,IDLE} */
+ 	unsigned int		idle_nr_running;   /* SCHED_IDLE */
+ 	unsigned int		idle_h_nr_running; /* SCHED_IDLE */
++	unsigned int		curr_latency_awareness;
++	unsigned long		curr_pod_load_avg;
+ 
+ 	u64			exec_clock;
+ 	u64			min_vruntime;
